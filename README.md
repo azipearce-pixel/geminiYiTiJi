@@ -1,4 +1,4 @@
-# Google AI Studio → SillyTavern 云反代
+# Google AI Studio → Render 云反代
 
 把 Google AI Studio 的 Gemini 模型接入 SillyTavern。你只需要 **Fork 本仓库 → 在 Render 部署 → 添加自己的 Cookie 或 Google API Key → 在 SillyTavern 填写接口地址**，不需要自己修改代码或购买服务器。
 
