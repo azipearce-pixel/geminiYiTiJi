@@ -265,19 +265,24 @@ async def _model_sources() -> tuple[dict[str, dict[str, Any]], dict[str, dict[st
 @router.get("/models")
 async def list_openai_models() -> dict[str, Any]:
     official, cookie = await _model_sources()
-    combined = dict(cookie)
+    # Cookie and official API Key are separate model channels. Prefixes make
+    # the source explicit and prevent accidental cross-channel fallback.
+    visible: list[dict[str, Any]] = []
+    for model_id, item in cookie.items():
+        visible.append({
+            "id": f"pg-{model_id}",
+            "object": "model",
+            "created": 0,
+            "owned_by": "aistudio-cookie",
+        })
     for model_id, item in official.items():
-        if model_id in combined:
-            combined[model_id] = {**combined[model_id], "owned_by": "google-ai-studio"}
-        else:
-            combined[model_id] = item
-    return {
-        "object": "list",
-        "data": [
-            {"id": item["id"], "object": "model", "created": 0, "owned_by": item["owned_by"]}
-            for item in sorted(combined.values(), key=lambda x: str(x["id"]))
-        ],
-    }
+        visible.append({
+            "id": f"ais-{model_id}",
+            "object": "model",
+            "created": 0,
+            "owned_by": "google-ai-studio-api-key",
+        })
+    return {"object": "list", "data": sorted(visible, key=lambda x: str(x["id"]))}
 
 
 def _content_to_parts(content: Any) -> list[dict[str, Any]]:
@@ -521,7 +526,7 @@ def _openai_sse_error(message: str, error_type: str = "api_error", code: str | N
     return "data: " + json.dumps(_api_error(message, error_type, code), ensure_ascii=False) + "\n\n"
 
 
-async def _official_nonstream(model: str, body: dict[str, Any]) -> dict[str, Any]:
+async def _official_nonstream(model: str, body: dict[str, Any], public_model: str | None = None) -> dict[str, Any]:
     attempted: set[str] = set()
     total_keys = len(key_pool.keys())
     if not total_keys:
@@ -539,7 +544,7 @@ async def _official_nonstream(model: str, body: dict[str, Any]) -> dict[str, Any
                     data = response.json()
                     if not isinstance(data, dict):
                         raise RuntimeError("Google API returned a non-object response")
-                    return _gemini_to_openai(data, model)
+                    return _gemini_to_openai(data, public_model or model)
                 last_message = f"Google API HTTP {response.status_code}: {_safe_error_text(response)}"
                 logger.warning("Google API key attempt %d/%d failed (HTTP %d); trying next key", index, total_keys, response.status_code)
             except Exception as exc:
@@ -548,7 +553,7 @@ async def _official_nonstream(model: str, body: dict[str, Any]) -> dict[str, Any
     raise HTTPException(502, last_message)
 
 
-async def _official_stream(model: str, body: dict[str, Any]) -> StreamingResponse | JSONResponse:
+async def _official_stream(model: str, body: dict[str, Any], public_model: str | None = None) -> StreamingResponse | JSONResponse:
     total_keys = len(key_pool.keys())
     if not total_keys:
         return JSONResponse(_api_error("No Google AI Studio API keys configured", "server_error"), status_code=503)
@@ -604,14 +609,14 @@ async def _official_stream(model: str, body: dict[str, Any]) -> StreamingRespons
                 except json.JSONDecodeError:
                     continue
                 if isinstance(data, dict):
-                    chunk = _gemini_stream_event(data, model, response_id)
+                    chunk = _gemini_stream_event(data, public_model or model, response_id)
                     if chunk:
                         yield chunk
             final_chunk = {
                 "id": response_id,
                 "object": "chat.completion.chunk",
                 "created": int(time.time()),
-                "model": model,
+                "model": public_model or model,
                 "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
             }
             yield "data: " + json.dumps(final_chunk, ensure_ascii=False) + "\n\n"
@@ -734,9 +739,22 @@ async def create_chat_completion(request: Request) -> Any:
     if not isinstance(payload, dict):
         return JSONResponse(_api_error("Request body must be a JSON object", "invalid_request_error"), status_code=400)
 
-    model = _clean_model_id(payload.get("model"))
-    if not model:
+    public_model = _clean_model_id(payload.get("model"))
+    if not public_model:
         return JSONResponse(_api_error("model is required", "invalid_request_error"), status_code=400)
+    if public_model.startswith("pg-"):
+        channel = "cookie"
+        model = public_model[3:]
+    elif public_model.startswith("ais-"):
+        channel = "official"
+        model = public_model[4:]
+    else:
+        return JSONResponse(
+            _api_error("Model ID must start with pg- (Cookie) or ais- (official API key)", "invalid_request_error"),
+            status_code=400,
+        )
+    if not model:
+        return JSONResponse(_api_error("Invalid prefixed model ID", "invalid_request_error"), status_code=400)
     stream = bool(payload.get("stream"))
     try:
         gemini_body = _openai_to_gemini(payload)
@@ -749,42 +767,37 @@ async def create_chat_completion(request: Request) -> Any:
     official_has_model = model in official
     cookie_has_model = model in cookie
 
-    # For models available from both services, official API keys are attempted
-    # first; if all key attempts fail, fall back to the Cookie-backed route.
-    if official_has_model or (not cookie_has_model and key_pool.keys()):
+    # The prefix selects exactly one credential channel. Never send a Cookie
+    # model to the official API-key endpoint (or vice versa).
+    if channel == "official":
+        if not official_has_model:
+            return JSONResponse(_api_error("This ais- model is not available from the configured official API keys", "invalid_request_error"), status_code=404)
         if stream:
-            official_response = await _official_stream(model, gemini_body)
-            if isinstance(official_response, StreamingResponse) or not cookie_has_model:
-                return official_response
-            # The preflight failed for every key. Use Cookie if this model is also
-            # present there; _official_stream returns a JSON error response.
-            official_detail = "Google API keys failed for this model"
-        else:
-            try:
-                data = await _official_nonstream(model, gemini_body)
-                return JSONResponse(data)
-            except HTTPException as exc:
-                if not cookie_has_model:
-                    return JSONResponse(_api_error(str(exc.detail)), status_code=exc.status_code)
-                official_detail = str(exc.detail)
-        if not cookie_has_model:
-            return JSONResponse(_api_error(official_detail), status_code=502)
+            return await _official_stream(model, gemini_body, public_model=public_model)
+        try:
+            data = await _official_nonstream(model, gemini_body, public_model=public_model)
+            return JSONResponse(data)
+        except HTTPException as exc:
+            return JSONResponse(_api_error(str(exc.detail)), status_code=exc.status_code)
+
+    if channel == "cookie" and not cookie_has_model:
+        return JSONResponse(_api_error("This pg- model is not available from the configured Cookie accounts", "invalid_request_error"), status_code=404)
 
     if cookie_has_model:
         try:
             cookie_result = await _cookie_completion(model, gemini_body, stream)
             if stream:
                 if isinstance(cookie_result, StreamingResponse):
-                    return await _cookie_stream_response(cookie_result, model)
+                    return await _cookie_stream_response(cookie_result, public_model)
                 # The existing service normally returns a StreamingResponse for
                 # stream=True; handle an unexpected object as a one-event stream.
                 if hasattr(cookie_result, "model_dump"):
                     cookie_data = cookie_result.model_dump(mode="json", by_alias=True, exclude_none=True)
                 else:
                     cookie_data = cookie_result if isinstance(cookie_result, dict) else {}
-                mapped = _gemini_to_openai(cookie_data, model)
+                mapped = _gemini_to_openai(cookie_data, public_model)
                 return StreamingResponse(
-                    iter(["data: " + json.dumps({"id": mapped["id"], "object": "chat.completion.chunk", "created": mapped["created"], "model": model, "choices": [{"index": 0, "delta": mapped["choices"][0]["message"], "finish_reason": mapped["choices"][0]["finish_reason"]}]}, ensure_ascii=False) + "\n\n", "data: [DONE]\n\n"]),
+                    iter(["data: " + json.dumps({"id": mapped["id"], "object": "chat.completion.chunk", "created": mapped["created"], "model": public_model, "choices": [{"index": 0, "delta": mapped["choices"][0]["message"], "finish_reason": mapped["choices"][0]["finish_reason"]}]}, ensure_ascii=False) + "\n\n", "data: [DONE]\n\n"]),
                     media_type="text/event-stream",
                 )
             if isinstance(cookie_result, StreamingResponse):
@@ -798,7 +811,7 @@ async def create_chat_completion(request: Request) -> Any:
             if isinstance(cookie_data.get("error"), dict):
                 error = cookie_data["error"]
                 return JSONResponse(_api_error(str(error.get("message") or "Cookie upstream error")), status_code=int(error.get("code") or 502))
-            return JSONResponse(_gemini_to_openai(cookie_data, model))
+            return JSONResponse(_gemini_to_openai(cookie_data, public_model))
         except HTTPException as exc:
             return JSONResponse(_api_error(str(exc.detail)), status_code=exc.status_code)
         except Exception as exc:
