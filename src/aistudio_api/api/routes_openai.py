@@ -6,8 +6,8 @@ The endpoint exposes:
 
 Official Gemini API keys are read from Render environment variables or Secret
 Files. Requests are round-robin distributed across keys; failed attempts move to
-the next key. Models visible to the existing AI Studio Cookie account are also
-exposed and can be used through the original upstream gateway.
+the next key. Only Gemini 3.1–4.0 chat models discovered through the configured
+credentials are exposed; Cookie and API-key sources remain isolated.
 """
 
 from __future__ import annotations
@@ -111,10 +111,56 @@ key_pool = GoogleApiKeyPool()
 _model_cache_lock = asyncio.Lock()
 _model_cache_time = 0.0
 _official_model_cache: dict[str, dict[str, Any]] = {}
+_cookie_model_cache_lock = asyncio.Lock()
+_cookie_model_cache_time = 0.0
+_cookie_model_cache: dict[str, dict[str, Any]] = {}
+
+# Expose only conversational Gemini models in the requested generation range.
+# Gemini 4 model IDs currently use "gemini-4-<name>" (for example,
+# gemini-4-argon); the optional .0 form is accepted as well.
+_GEMINI_CHAT_MODEL_RE = re.compile(r"^gemini-(?:3\.[1-9]\d*|4(?:\.0)?)-", re.IGNORECASE)
+_NON_CHAT_MODEL_RE = re.compile(
+    r"(?:^|[-_.])(?:image|tts|live|transcribe|transcription|translate|audio|speech|"
+    r"video|veo|omni|music|lyria|embedding|embed|robotics|realtime|decision)(?:[-_.]|$)",
+    re.IGNORECASE,
+)
 
 
 def _clean_model_id(value: object) -> str:
     return str(value or "").strip().removeprefix("models/")
+
+
+def _is_gemini_chat_model(model_id: object, info: Mapping[str, Any] | None = None) -> bool:
+    """True only for Gemini 3.1–4.0 conversational models, not modality tools."""
+    clean_id = _clean_model_id(model_id).lower()
+    if not clean_id or not _GEMINI_CHAT_MODEL_RE.match(clean_id):
+        return False
+    if _NON_CHAT_MODEL_RE.search(clean_id):
+        return False
+    if info is not None:
+        methods = info.get("supportedGenerationMethods")
+        if isinstance(methods, list) and "generateContent" not in methods:
+            return False
+    return True
+
+
+def _cookie_model_allowed_for_tier(info: Mapping[str, Any], tier: object) -> bool:
+    """Respect the AI Studio Pro/Ultra accessModes attached to each Cookie model."""
+    modes = info.get("accessModes")
+    if not isinstance(modes, list) or not modes:
+        return True
+    normalized_tier = str(tier or "Free").strip().lower()
+    is_high_tier = (
+        normalized_tier in ("plus", "pro", "ultra")
+        or "ultra" in normalized_tier
+        or "pro" in normalized_tier
+    )
+    is_ultra_tier = "ultra" in normalized_tier
+    if 3 in modes and is_high_tier:
+        return True
+    if 4 in modes and is_ultra_tier:
+        return True
+    return all(mode not in (3, 4) for mode in modes)
 
 
 def _api_error(message: str, error_type: str = "api_error", code: str | None = None) -> dict[str, Any]:
@@ -153,8 +199,8 @@ def _http_client() -> httpx.AsyncClient:
 async def _fetch_models_for_key(client: httpx.AsyncClient, key: str) -> list[dict[str, Any]]:
     token: str | None = None
     found: list[dict[str, Any]] = []
-    # Google listModels is paginated. Usually one page is enough, but follow the
-    # token so the returned list represents the actual key's model entitlement.
+    # Google listModels is key-scoped and paginated. Only keep models whose
+    # returned metadata explicitly supports generateContent.
     for _ in range(10):
         params: dict[str, str | int] = {"pageSize": 1000}
         if token:
@@ -172,11 +218,11 @@ async def _fetch_models_for_key(client: httpx.AsyncClient, key: str) -> list[dic
             for item in raw_models:
                 if not isinstance(item, dict):
                     continue
-                methods = item.get("supportedGenerationMethods") or []
-                if "generateContent" not in methods:
-                    continue
                 model_id = _clean_model_id(item.get("name"))
-                if not model_id:
+                methods = item.get("supportedGenerationMethods") or []
+                if not isinstance(methods, list) or "generateContent" not in methods:
+                    continue
+                if not _is_gemini_chat_model(model_id, item):
                     continue
                 found.append({
                     "id": model_id,
@@ -196,13 +242,16 @@ async def _get_official_models(force: bool = False) -> dict[str, dict[str, Any]]
     global _model_cache_time, _official_model_cache
     keys = key_pool.keys()
     if not keys:
+        # Do not keep advertising stale models after the configured key source is removed.
+        _official_model_cache = {}
+        _model_cache_time = time.monotonic()
         return {}
     now = time.monotonic()
-    if not force and _official_model_cache and now - _model_cache_time < 300:
+    if not force and _model_cache_time > 0 and now - _model_cache_time < 60:
         return dict(_official_model_cache)
     async with _model_cache_lock:
         now = time.monotonic()
-        if not force and _official_model_cache and now - _model_cache_time < 300:
+        if not force and _model_cache_time > 0 and now - _model_cache_time < 60:
             return dict(_official_model_cache)
         collected: dict[str, dict[str, Any]] = {}
         async with _http_client() as client:
@@ -219,42 +268,90 @@ async def _get_official_models(force: bool = False) -> dict[str, dict[str, Any]]
             for item in result:
                 collected.setdefault(str(item["id"]), item)
         if ok_keys:
+            # An authoritative empty list is still a successful result; remove stale entries.
             _official_model_cache = collected
             _model_cache_time = time.monotonic()
-        return dict(_official_model_cache)
-
-
-async def _get_cookie_models() -> dict[str, dict[str, Any]]:
-    """Read only models from configured/managed Cookie accounts (not fallback list)."""
-    try:
-        from aistudio_api.api.state import runtime_state
-        from aistudio_api.infrastructure.account.account_store import AccountStore
-        from aistudio_api.infrastructure.gateway.model_discovery import model_discovery
-
-        enabled_accounts = [a for a in AccountStore().list_accounts() if a.enabled]
-        if not enabled_accounts:
-            return {}
-        session = runtime_state.client.session if runtime_state.client else None
-        raw_models = await model_discovery.get_models(session=session)
-        result: dict[str, dict[str, Any]] = {}
-        for item in raw_models:
-            if not isinstance(item, Mapping):
-                continue
-            model_id = _clean_model_id(item.get("id") or item.get("name"))
-            if not model_id:
-                continue
-            result[model_id] = {
-                "id": model_id,
-                "object": "model",
-                "created": 0,
-                "owned_by": "aistudio-cookie",
-                "display_name": str(item.get("displayName") or item.get("display_name") or model_id),
-                "description": str(item.get("description") or ""),
-            }
-        return result
-    except Exception as exc:
-        logger.warning("Could not discover Cookie-account models: %s", exc)
+            return dict(collected)
+        # If every key failed, clear the previous cache as well: never advertise
+        # models that were not verified by the currently configured credentials.
+        _official_model_cache = {}
+        _model_cache_time = time.monotonic()
         return {}
+
+
+async def _get_cookie_models(force: bool = False) -> dict[str, dict[str, Any]]:
+    """Query each enabled Cookie account directly; never use the static fallback list."""
+    global _cookie_model_cache, _cookie_model_cache_time
+    now = time.monotonic()
+    if not force and _cookie_model_cache_time > 0 and now - _cookie_model_cache_time < (60 if _cookie_model_cache else 10):
+        return dict(_cookie_model_cache)
+
+    async with _cookie_model_cache_lock:
+        now = time.monotonic()
+        if not force and _cookie_model_cache_time > 0 and now - _cookie_model_cache_time < (60 if _cookie_model_cache else 10):
+            return dict(_cookie_model_cache)
+
+        result: dict[str, dict[str, Any]] = {}
+        try:
+            from aistudio_api.infrastructure.account.account_store import AccountStore
+            from aistudio_api.infrastructure.account.cookie_parser import load_cookies_from_auth_file
+            from aistudio_api.infrastructure.gateway.model_discovery import model_discovery
+
+            store = AccountStore()
+            enabled_accounts = [account for account in store.list_accounts() if account.enabled]
+            semaphore = asyncio.Semaphore(5)
+
+            async def fetch_account_models(account: Any) -> list[dict[str, Any]]:
+                auth_path = store.get_auth_path_optional(account.id, require_exists=True)
+                if auth_path is None:
+                    return []
+                cookies = load_cookies_from_auth_file(str(auth_path))
+                if not cookies:
+                    return []
+                async with semaphore:
+                    # _fetch_via_http returns only the live ListModels response. Unlike
+                    # get_models(), it does not replace failures with _FALLBACK_MODELS.
+                    return await model_discovery._fetch_via_http(
+                        cookies,
+                        str(account.auth_user or "0"),
+                        tier=str(getattr(account, "tier", "Free") or "Free"),
+                    )
+
+            fetched = await asyncio.gather(
+                *(fetch_account_models(account) for account in enabled_accounts),
+                return_exceptions=True,
+            )
+            for account, account_models in zip(enabled_accounts, fetched):
+                if isinstance(account_models, Exception):
+                    logger.warning(
+                        "Could not discover Cookie models for account %s: %s",
+                        account.id,
+                        type(account_models).__name__,
+                    )
+                    continue
+                for item in account_models:
+                    if not isinstance(item, Mapping):
+                        continue
+                    model_id = _clean_model_id(item.get("id") or item.get("name"))
+                    if not _is_gemini_chat_model(model_id, item):
+                        continue
+                    if not _cookie_model_allowed_for_tier(item, getattr(account, "tier", "Free")):
+                        continue
+                    result.setdefault(model_id, {
+                        "id": model_id,
+                        "object": "model",
+                        "created": 0,
+                        "owned_by": "aistudio-cookie",
+                        "display_name": str(item.get("displayName") or item.get("display_name") or model_id),
+                        "description": str(item.get("description") or ""),
+                    })
+        except Exception as exc:
+            logger.warning("Could not discover Cookie-account models: %s", type(exc).__name__)
+            result = {}
+
+        _cookie_model_cache = result
+        _cookie_model_cache_time = time.monotonic()
+        return dict(result)
 
 
 async def _model_sources() -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
@@ -265,24 +362,24 @@ async def _model_sources() -> tuple[dict[str, dict[str, Any]], dict[str, dict[st
 @router.get("/models")
 async def list_openai_models() -> dict[str, Any]:
     official, cookie = await _model_sources()
-    # Cookie and official API Key are separate model channels. Prefixes make
-    # the source explicit and prevent accidental cross-channel fallback.
+    # Keep both credentials sources visible as distinct models, even when
+    # they expose the same upstream Gemini model ID.
     visible: list[dict[str, Any]] = []
-    for model_id, item in cookie.items():
+    for model_id in cookie:
         visible.append({
             "id": f"pg-{model_id}",
             "object": "model",
             "created": 0,
             "owned_by": "aistudio-cookie",
         })
-    for model_id, item in official.items():
+    for model_id in official:
         visible.append({
             "id": f"ais-{model_id}",
             "object": "model",
             "created": 0,
             "owned_by": "google-ai-studio-api-key",
         })
-    return {"object": "list", "data": sorted(visible, key=lambda x: str(x["id"]))}
+    return {"object": "list", "data": sorted(visible, key=lambda item: str(item["id"]))}
 
 
 def _content_to_parts(content: Any) -> list[dict[str, Any]]:
