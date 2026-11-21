@@ -138,12 +138,6 @@ curl -H "Authorization: Bearer YOUR_AISTUDIO_WEB_PASSWORD" \
 | API Key | 你的 `AISTUDIO_WEB_PASSWORD` |
 | Model | 点击刷新模型列表，然后选择模型 |
 
-你的 Render 服务如果名称为 `aistudio-api-illj`，Base URL 就是：
-
-```text
-https://aistudio-api-illj.onrender.com/v1
-```
-
 不要再选 Google Gemini 原生连接类型；这次新增的是 OpenAI Chat Completions 兼容接口。
 
 ## 9. Key 轮询规则
