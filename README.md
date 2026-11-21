@@ -1,173 +1,235 @@
-# AI Studio Render：OpenAI 兼容接口 + Render Secret 配置补丁
+# Google AI Studio → SillyTavern 云反代
 
-本补丁是**增量覆盖包**，不是完整的 aistudio-api 源码仓库。它基于 `azipearce-pixel/aistudio-api-render` 当前 `master` 结构，新增 OpenAI 兼容接口，并通过 `apply_patch.py` 对原项目 `src/aistudio_api/api/app.py` 做少量自动接线。原 Gemini `/v1beta` 路由、Web 管理台、Cookie 账号调度及 WAA signer 不需要重写。
+把 Google AI Studio 的 Gemini 模型接入 SillyTavern。你只需要 **Fork 本仓库 → 在 Render 部署 → 添加自己的 Cookie 或 Google API Key → 在 SillyTavern 填写接口地址**，不需要自己修改代码或购买服务器。
 
-## 1. 下载并解压原仓库
+> 本项目部署的是你自己的独立服务。Cookie、Google API Key 和 SillyTavern 访问密码都由你自己配置，请勿把这些凭据提交到 GitHub。
 
-1. 打开原仓库：<https://github.com/azipearce-pixel/aistudio-api-render>
-2. 点击 **Code → Download ZIP**，解压到本地。
-3. 确认解压后的项目根目录中能看到 `main.py`、`Dockerfile`、`render.yaml` 和 `src/`。
+## 功能
 
-## 2. 应用本补丁
+- **SillyTavern 兼容**：提供 OpenAI Chat Completions 接口，可在酒馆中使用 `Chat Completion` 连接。
+- **两种上游凭据**：支持 Google AI Studio 网页 Cookie，以及 Google AI Studio 官方 Gemini API Key。
+- **多凭据轮询**：支持配置多枚 Cookie 和多枚官方 API Key；官方 Key 请求失败时会尝试下一枚。
+- **按实际权限列出模型**：模型列表分别从已配置的 Cookie 账号和 API Key 查询，不会把预设模型冒充成可用模型。
+- **精简模型列表**：只展示 Gemini 3.1–4.0 范围内、符合聊天生成条件的 Gemini 模型；不展示 Gemini 3.0、2.x、Gemma 或图片、语音、视频等专用模型。
+- **区分凭据渠道**：`pg-` 模型只使用 Cookie，`ais-` 模型只使用官方 API Key，不会跨渠道回退。
+- **Render 健康检查**：部署配置已设置 `/health`。
 
-1. 将本补丁 ZIP 解压到上述项目根目录，保留目录结构；出现同名文件时允许覆盖。
-2. 在项目根目录打开终端（Windows 可在文件夹地址栏输入 `cmd` 后回车）。
-3. 执行：
+## 一、准备工作
 
-```bash
-python apply_patch.py
-```
+开始前，你需要：
 
-看到以下提示即表示接线完成：
+1. 一个 GitHub 账号。
+2. 一个 Render 账号：<https://render.com/>。
+3. 至少一种可用的上游凭据：
+   - Google AI Studio 网页登录 Cookie；或
+   - Google AI Studio 官方 Gemini API Key。
+
+Cookie 和 API Key 可以同时配置，也可以只配置其中一种。两种方式的模型会在 SillyTavern 中分别显示。
+
+## 二、Fork 本仓库
+
+1. 登录 GitHub，打开本项目仓库：<https://github.com/azipearce-pixel/geminiYiTiJi>。
+2. 点击页面右上角的 **Fork**。
+3. 在 Fork 页面选择你自己的 GitHub 账号，创建仓库。
+4. Fork 完成后，你会得到一个属于自己的仓库，例如：`https://github.com/你的用户名/gemini`。
+
+后续部署请使用你自己 Fork 出来的仓库，而不是直接部署原仓库。
+
+## 三、在 Render 部署
+
+本仓库已经包含 `render.yaml`，Render 会自动读取部署配置。**请使用 Blueprint 部署，不要手动新建普通 Web Service。**
+
+1. 登录 <https://dashboard.render.com/>。
+2. 点击左上角 **New +**，选择 **Blueprint**。
+3. 连接 GitHub，并授权 Render 访问你刚才 Fork 的仓库。
+4. 选择自己的 `aistudio-api-render` 仓库和 `master` 分支。
+5. Render 会自动读取 `render.yaml`。确认服务配置后继续。
+6. 当 Render 要求填写 `AISTUDIO_WEB_PASSWORD` 时，设置一段你自己保存的强密码，然后创建并部署。
+   - 如果创建时没有出现输入框，部署完成后进入服务的 **Environment** 页面，手动添加同名变量和值，再保存部署。
+7. 等待首次构建和部署完成。可在 Render 服务的 **Events** 或 **Logs** 页面查看状态。
+
+仓库中的部署配置已经设置好 Docker 构建方式、启动命令、`10000` 端口和 `/health` 健康检查；通常不需要自行填写 Build Command、Start Command 或端口。
+
+部署成功后，Render 会分配一个服务地址，格式类似：
 
 ```text
-[OK] OpenAI-compatible routes mounted at /v1
-[OK] Render Cookie Secret File import wired into startup
+https://你的服务名称.onrender.com
 ```
 
-补丁新增/覆盖的文件：
+请记下这个地址，后面配置 SillyTavern 时会用到。
 
-- `src/aistudio_api/api/routes_openai.py`：`/v1/models`、`/v1/chat/completions`。
-- `src/aistudio_api/api/render_secrets.py`：从 Render 环境变量/Secret File 导入 Cookie。
-- `src/aistudio_api/api/app.py`：由补丁脚本自动增加路由挂载和 Cookie 导入钩子。
+## 四、配置上游凭据
 
-## 3. 提交回你自己的 GitHub 仓库
+部署完成后，打开 Render Dashboard → 你的 Web Service → **Environment**。推荐通过 **Secret Files** 保存凭据，避免把密钥直接写进 GitHub 仓库。
 
-1. 将修改后的项目推送到你用于 Render 部署的 GitHub 仓库。
-2. 确认提交包含 `apply_patch.py`、`README_部署说明.md`、两个新增 Python 文件，以及已修改的 `src/aistudio_api/api/app.py`。
-3. Render 如果已经连接这个仓库并开启 Auto-Deploy，会自动开始部署；否则在 Render 服务页面手动点 **Manual Deploy → Deploy latest commit**。
+### 方式 A：使用 Google AI Studio Cookie
 
-> 不要把 Cookie、Google API Key、`.env` 或包含凭据的 Secret File 上传到 GitHub。补丁包本身不含任何密钥。
+适合希望通过 Google AI Studio 网页账号使用模型的用户。
 
-## 4. 在 Render 配置 Cookie
+#### 1. 导出 Cookie
 
-进入 **Render Dashboard → 你的 Web Service → Environment**。
+1. 在浏览器中登录 <https://aistudio.google.com/>，确认可以正常打开 AI Studio。
+2. 在该浏览器中使用 Cookie-Editor 等 Cookie 导出扩展。
+3. 在 `aistudio.google.com` 页面导出 Cookie，格式选择 **JSON**。
+4. 复制或保存完整导出内容。不要把 Cookie 发给他人。
 
-推荐使用 **Secret Files**，可以配置多枚 Cookie，每枚 Cookie 会作为独立账号导入原有账号池：
+#### 2. 上传到 Render Secret Files
 
-1. 分别登录两个 Google AI Studio 账号，用 Cookie-Editor 各自导出完整 JSON。
-2. Render 的 **Secret Files → Add Secret File** 添加两份文件：
-   - Filename：`cookie1.json`，Contents：第一个账号导出的完整 JSON。
-   - Filename：`cookie2.json`，Contents：第二个账号导出的完整 JSON。
-3. 在 **Environment Variables → Add Environment Variable** 添加：
+1. 在 Render 服务的 **Environment** 页面找到 **Secret Files**。
+2. 点击 **Add File**。
+3. `Filename` 填写 `aistudio_cookie1.json`。
+4. 将刚才导出的完整 JSON 内容粘贴到 `Contents`。
+5. 保存。
+
+#### 3. 添加对应环境变量
+
+在同一个 **Environment** 页面找到 **Environment Variables**，添加：
 
 | Key | Value |
 |---|---|
-| `AISTUDIO_COOKIE1_FILE` | `/etc/secrets/cookie1.json` |
-| `AISTUDIO_COOKIE2_FILE` | `/etc/secrets/cookie2.json` |
+| `AISTUDIO_COOKIE1_FILE` | `/etc/secrets/aistudio_cookie1.json` |
 
-完成后保存并重新部署即可。后台账号池中会分别显示 `Render Cookie 1` 和 `Render Cookie 2`，由原项目的账号调度机制管理。最多支持编号 1–10，例如 `AISTUDIO_COOKIE3_FILE` 对应 `/etc/secrets/cookie3.json`。
+完成后保存并等待 Render 重新部署。服务启动时会自动导入这枚 Cookie。
 
-旧配置仍然兼容：`AISTUDIO_COOKIE_FILE` + `/etc/secrets/aistudio_cookie.json` 仍可作为额外的单个 Cookie 导入；也支持 `AISTUDIO_COOKIE` 直接放 Cookie 内容。多 Cookie 推荐使用上面的编号方式，不需要把 Cookie 粘贴到环境变量值中。
+#### 4. 添加更多 Cookie（可选）
 
-可选项：
+最多支持编号 1–10。每枚 Cookie 使用一个独立的 Secret File 和环境变量，例如：
 
-| Key | 作用 | 默认值 |
+| Secret File 文件名 | Environment Variable | Value |
 |---|---|---|
-| `AISTUDIO_COOKIE_TIER` | Cookie 账号初始订阅等级，后续原账号服务仍会尝试刷新识别 | `Free` |
-| `AISTUDIO_COOKIE_AUTH_USER` | AI Studio 多登录身份的用户序号 | `0` |
-| `AISTUDIO_COOKIE_NAME` | 管理后台账号列表中显示的名称 | `Render Secret Cookie` |
+| `aistudio_cookie1.json` | `AISTUDIO_COOKIE1_FILE` | `/etc/secrets/aistudio_cookie1.json` |
+| `aistudio_cookie2.json` | `AISTUDIO_COOKIE2_FILE` | `/etc/secrets/aistudio_cookie2.json` |
+| `aistudio_cookie3.json` | `AISTUDIO_COOKIE3_FILE` | `/etc/secrets/aistudio_cookie3.json` |
 
-每枚 Cookie 会在每次服务启动时按固定账号 ID 导入已有账号库，不会每次启动都创建新账号。原项目已有的 Cookie 轮换任务仍负责运行时更新会话 Cookie。
+后续依此类推。每个 Cookie 会作为独立账号加入账号池。
 
-## 5. 在 Render 配置 Google AI Studio 官方 API Key
+**订阅等级（可选）**：如果 Cookie 对应的 AI Studio 账号是 Pro 或 Ultra，可在 Environment Variables 中添加 `AISTUDIO_COOKIE_TIER`，Value 填写 `Pro` 或 `Ultra`。不设置时默认为 `Free`。请按 Cookie 对应账号的实际订阅等级填写。
 
-同样推荐使用 **Secret Files**：
+### 方式 B：使用 Google AI Studio 官方 API Key
 
-1. Render → **Environment → Secret Files → Add Secret File**。
-2. Filename：`google_api_keys.txt`。
-3. Contents：每行一枚 Google AI Studio 官方 API Key，例如：
+适合希望直接通过 Google Gemini API 使用模型的用户。
+
+1. 打开 Google AI Studio 的 API Key 管理页面：<https://aistudio.google.com/apikey>。
+2. 创建或复制你自己的 Gemini API Key。
+3. 回到 Render 服务的 **Environment → Secret Files**。
+4. 点击 **Add File**。
+5. `Filename` 填写 `google_api_keys.txt`。
+6. 在 `Contents` 中粘贴 API Key。多枚 Key 请每行放一枚，例如：
 
 ```text
-AIzaSyXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
-AIzaSyYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYY
-AIzaSyZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ
+你的第一枚Google_API_Key
+你的第二枚Google_API_Key
+你的第三枚Google_API_Key
 ```
 
-4. 在 **Environment Variables** 添加：
+7. 保存后，在 **Environment Variables** 中添加：
 
 | Key | Value |
 |---|---|
 | `GOOGLE_API_KEYS_FILE` | `/etc/secrets/google_api_keys.txt` |
 
-也可以不用 Secret File，直接设置 `GOOGLE_API_KEYS` 环境变量，多枚 Key 用英文逗号、分号或换行分隔。也兼容 `GOOGLE_AI_STUDIO_API_KEYS`、`GEMINI_API_KEYS`，以及单枚 Key 的 `GOOGLE_API_KEY` / `GEMINI_API_KEY`。
+8. 保存并等待 Render 重新部署。
 
-## 6. 保留网页密码作为 SillyTavern 的 API Key
+服务启动后会读取文件中的所有 Key，并在模型查询和请求时使用。多枚 Key 会轮询；某枚 Key 请求失败时，会继续尝试其他已配置的 Key。
 
-原项目的 `AISTUDIO_WEB_PASSWORD` 同时被原 API 鉴权逻辑接受为 API Key。因此 SillyTavern 中直接填写你已经设置的 **AISTUDIO_WEB_PASSWORD** 即可，不必把 Google 官方 API Key 放进 SillyTavern。
+> **安全提醒：** Google API Key 是上游访问凭据，可能关联你的配额或计费项目。请妥善保管，并在 Google AI Studio 中留意自己的使用量和计费设置。不要把 Key 填入 SillyTavern 的 API Key 栏。
 
-注意：
+### 两种方式都配置
 
-- `AISTUDIO_WEB_PASSWORD` 是你自己服务的下游访问密码。
-- `GOOGLE_API_KEYS` 是服务端访问 Google 官方 Gemini API 的上游密钥。
-- 两者用途不同，不要把 Google 官方 Key 填进客户端。
+Cookie 和官方 API Key 可以同时使用。只需分别完成方式 A 和方式 B。服务会把两种来源的模型分别列出，不会混在一起或互相代替。
 
-## 7. 部署后检查
+## 五、在 SillyTavern 中连接
 
-部署日志中不应出现 Cookie 或 API Key 原文。先检查：
+等 Render 部署完成、并且至少配置好一种上游凭据后，打开 SillyTavern：
+
+1. 进入 **API Connections（API 连接）**。
+2. API 类型选择 **Chat Completion**。
+3. 服务提供方选择 **OpenAI** 或 OpenAI 兼容接口。
+4. 在自定义端点 / Base URL 中填写：
+
+   ```text
+   https://你的服务名称.onrender.com/v1
+   ```
+
+5. API Key 留空，因此**千万不要随意把服务器网址交给他人！**
+6. 点击刷新模型列表，选择需要使用的模型，然后保存连接。
+
+**注意：** 这里使用的是 OpenAI 兼容的 Chat Completion 接口，不要选择 Google Gemini 原生 API 连接类型。
+
+## 六、模型前缀说明
+
+模型名称前缀代表它所使用的凭据来源：
+
+| 模型前缀 | 凭据来源 | 实际请求渠道 |
+|---|---|---|
+| `pg-` | Google AI Studio 网页 Cookie | 只使用 Cookie 账号 |
+| `ais-` | Google AI Studio 官方 API Key | 只使用官方 API Key |
+
+例如，同一个 Gemini 模型如果两个渠道都能提供，可能会分别出现：
 
 ```text
-https://你的服务名.onrender.com/health
+pg-gemini-3.8-flash
+ais-gemini-3.8-flash
 ```
 
-应返回原项目的健康检查响应。
+它们是两个独立选项。选择 `pg-` 不会自动改用官方 API Key；选择 `ais-` 也不会改用 Cookie。
 
-然后在本地 PowerShell / 终端测试模型列表（把占位密码替换为你的 `AISTUDIO_WEB_PASSWORD`）：
+模型列表会根据配置的 Cookie 账号和 API Key 实际查询结果生成，并进行 Gemini 3.1–4.0 聊天模型筛选。模型目录约缓存 60 秒；刚添加凭据或修改权限后，可稍等片刻再刷新模型列表。
 
-```bash
-curl -H "Authorization: Bearer YOUR_AISTUDIO_WEB_PASSWORD" \
-  https://你的服务名.onrender.com/v1/models
+> 模型出现在列表中，表示对应凭据的模型目录返回了该模型并通过筛选；这不代表每次调用都一定成功。Google 仍可能因账号权限、项目状态、地区、配额或计费限制拒绝具体请求。
+
+## 七、检查服务是否正常
+
+在浏览器中打开：
+
+```text
+https://你的服务名称.onrender.com/health
 ```
 
-应返回 OpenAI 格式的模型列表：`{"object":"list","data":[...]}`。列表来自两部分：
+如果服务正常运行，会返回健康检查响应。Render 的 Blueprint 已将 `/health` 配置为健康检查路径。
 
-- Cookie 账号通过原 AI Studio 模型发现机制识别到的模型。
-- 每一枚官方 API Key 分别调用 Google `ListModels` 后汇总的模型。
+如果 SillyTavern 无法连接，请依次检查：
 
-若多个来源都有同名模型，只显示一条；调用时优先尝试官方 API Key，所有 Key 都失败后再回退 Cookie。
+- Render 的首次部署是否已经成功，服务状态是否为 Live。
+- Base URL 是否以 `/v1` 结尾，且没有多余空格或重复斜杠。
+- 是否至少配置了一种有效的 Cookie 或官方 API Key。
+- Secret File 文件名、路径和环境变量是否逐字对应。
+- Render 保存配置后是否完成了新一轮部署。
 
-## 8. SillyTavern 设置
+## 八、常见问题
 
-进入 SillyTavern 的 **API Connections**：
+### 1. SillyTavern 刷新模型列表后没有任何模型
 
-| 项目 | 填写内容 |
-|---|---|
-| API | `Chat Completion` / OpenAI-compatible |
-| Source / Provider | OpenAI（或兼容 OpenAI 的自定义服务） |
-| Custom Endpoint / Base URL | `https://你的服务名.onrender.com/v1` |
-| API Key | 你的 `AISTUDIO_WEB_PASSWORD` |
-| Model | 点击刷新模型列表，然后选择模型 |
+请检查是否已经添加 Cookie 或官方 API Key，并确认对应 Secret File 的环境变量路径正确。Cookie 必须来自仍然有效的 AI Studio 登录会话；官方 API Key 必须能够访问 Gemini API。修改凭据后等待部署完成，再刷新模型列表。
 
-不要再选 Google Gemini 原生连接类型；这次新增的是 OpenAI Chat Completions 兼容接口。
+### 2. 模型列表只有 `pg-`，没有 `ais-`
 
-## 9. Key 轮询规则
+说明当前 Cookie 渠道发现了符合条件的模型，但官方 API Key 渠道没有查询到符合筛选条件的模型。检查 `google_api_keys.txt` 内容和 `GOOGLE_API_KEYS_FILE` 路径，并确认 Key 本身有效。
 
-- 每一次真正发往 Google 的上游尝试都会消耗一个轮询位置；成功、HTTP 报错、连接异常都一样。
-- 当前 Key 失败会立即取下一枚 Key 尝试；同一条请求最多尝试当前配置的每枚 Key 一次，避免无限重试。
-- 下一条请求会从上一条请求最后一次实际尝试的 Key 后面继续，不会因前一条请求发生故障而反复卡在同一枚 Key。
-- `/v1/models` 会分别读取所有 Key 的模型权限并合并结果；模型发现过程本身不消耗聊天请求的轮询位置。
-- 流式请求在收到 Google 的成功响应头之前可以自动切换 Key；如果流已经开始输出文本后连接中断，无法安全地从另一枚 Key 重放而不造成重复内容，因此会向客户端报告流中断，不会从头重试。
+### 3. 模型列表只有 `ais-`，没有 `pg-`
 
-## 10. 支持范围与注意事项
+说明官方 API Key 渠道发现了模型，但 Cookie 渠道没有查询到符合条件的模型。检查 Cookie 是否完整、是否仍有效，以及 `AISTUDIO_COOKIE1_FILE` 是否指向正确的文件。
 
-此补丁主要面向 SillyTavern 的 OpenAI Chat Completion 文本对话：支持 `/v1/models`、`/v1/chat/completions`、system/developer/user/assistant/tool 消息、常用采样参数、JSON 输出模式、基本函数声明，以及 Base64 Data URL 输入图片。它**不是完整的 OpenAI API 重实现**，不包含 `/v1/responses`、Embeddings、Audio API、图像生成 API 等独立端点；远程 HTTP 图片 URL 需要客户端改为 Base64 Data URL。函数调用声明和非流式函数调用结果有基础转换支持，流式函数调用增量目前不支持。
+### 4. 模型能显示，但调用时返回 403、404 或配额错误
 
-官方 Key 模型清单按 Key 实际返回的 `ListModels` 结果过滤 `generateContent` 能力；Cookie 清单来自当前已导入账号的 AI Studio 模型发现结果。Google 可能因项目状态、地区、配额、API 版本或账号权限拒绝某个模型，模型出现在列表中不代表该次调用一定有配额。
+模型是否可见与本次请求是否一定能成功并不是一回事。请检查对应凭据的模型权限、Google 项目状态、订阅等级、地区限制和剩余配额。`pg-` 与 `ais-` 使用不同凭据渠道，请根据模型前缀检查对应账号或 API Key。
 
-### Render 免费实例与 Cookie 持久性
+### 5. 免费 Render 服务第一次打开很慢，或一段时间不用后要等待
 
-Render Secret Files 会在运行时挂载到 `/etc/secrets/<filename>`，服务每次启动会重新从 Secret File 导入 Cookie，因此 Web 管理后台里临时导入的 Cookie 不再是唯一来源。
+Render Free Web Service 在连续 15 分钟没有收到入站流量后会自动休眠；下一次请求会唤醒服务，通常需要约一分钟。免费实例的本地文件系统也是临时的，服务休眠、重启或重新部署时，本地运行数据可能丢失。Render 中配置的 Secret Files 不会因为应用本地文件丢失而变成 GitHub 文件；服务再次启动时会重新读取这些 Secret Files。若需要持久保存运行时账号状态和统计数据，需要使用支持 Persistent Disk 的付费实例，并按需配置磁盘。
 
-但原项目运行时轮换后的 Cookie 写入 `/app/data/accounts`。Render 免费实例没有持久磁盘，服务休眠、重建或重启后这部分运行时更新可能丢失，启动时只能重新导入 Secret File 中保存的初始 Cookie。Secret File 是只读配置来源，应用不会把轮换后的 Cookie 自动写回 Render 控制台；若初始 Cookie 已经失效，需重新导出一份有效 Cookie 并更新 Secret File。若要长期保存自动轮换后的 Cookie 和账号状态，应使用支持 Persistent Disk 的 Render 服务，并把磁盘挂载到 `/app/data`。Secret File 本身可留在 Render，不要把 Cookie 提交到 Git。现有 `/health` 路由是 Render 服务健康检查接口；它本身不是进程内保活任务。Render 官方说明免费 Web Service 在 15 分钟没有入站流量后会休眠，唤醒通常约需一分钟；若要避免休眠，需要外部定时访问服务（例如监控服务每 10–14 分钟请求一次 `/health`），或改用付费实例。Render 也可能在任何时候重启免费实例。详见 [Render Free 服务说明](https://render.com/docs/free)。
+## 九、安全与使用须知
 
-## 11. 常见问题
+- **不要将 Cookie、API Key、`AISTUDIO_WEB_PASSWORD` 或其他私密凭据提交到 GitHub。** 只在 Render 的 Environment / Secret Files 中填写。
+- 不要将自己的 Render 服务地址和访问密码公开给不可信任的人；任何获得访问密码的人都可能使用你配置的上游额度。
+- Google 上游服务的可用性、模型访问权限、速率限制和计费规则由 Google 决定；请自行遵守 Google AI Studio / Gemini API 的相关条款。
+- Render Free 有休眠、临时文件系统和月度使用量限制，适合个人测试和轻量使用，不保证持续在线。
 
-**`/v1/models` 返回 401**：检查 SillyTavern / curl 是否使用 `Authorization: Bearer <AISTUDIO_WEB_PASSWORD>`，并确认 Render 上已保存并部署该环境变量。
+## 相关链接
 
-**模型列表只有一部分**：确认 `GOOGLE_API_KEYS_FILE` 指向 `/etc/secrets/google_api_keys.txt`，Secret File 文件名大小写完全一致，并查看 Render 日志中是否有某枚 Key 的 ListModels 读取失败提示（日志不会打印 Key 本身）。
-
-**Cookie 模型列表为空**：确认 `AISTUDIO_COOKIE_FILE` 路径正确，Secret File JSON 是 Cookie-Editor 导出的 JSON，而不是浏览器导出的 HAR 文件；并确认 Cookie 对应的 AI Studio 会话仍有效。
-
-**能列出模型但生成报错**：这通常是上游权限、配额、模型当前状态或请求参数造成的。官方 Key 会按轮询顺序自动尝试下一枚；若同一模型也存在 Cookie 来源，所有 Key 失败后会回退 Cookie。
-
-**SillyTavern 仍然只显示直连**：确认 API 类型选择的是 OpenAI-compatible / Chat Completion，而不是 Google Gemini 原生协议；Base URL 必须带 `/v1`。
+- [本项目 GitHub 仓库](https://github.com/azipearce-pixel/geminiYiTiJi)
+- [Render Blueprint 部署文档](https://render.com/docs/blueprint-spec)
+- [Render 环境变量与 Secret Files 文档](https://render.com/docs/configure-environment-variables)
+- [Render 免费服务限制](https://render.com/docs/free)
+- [Google AI Studio](https://aistudio.google.com/)
+- [Google Gemini API Key 管理](https://aistudio.google.com/apikey)
